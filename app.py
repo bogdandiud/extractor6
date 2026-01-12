@@ -4,7 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uuid, os, subprocess, requests, csv, math, shutil
 import yt_dlp
-
+import base64
 import cv2
 import numpy as np
 import time
@@ -360,6 +360,31 @@ def is_unique_hash(new_hash: int, used_hashes: list, min_dist: int) -> bool:
             return False
     return True
 
+def ensure_cookies_file():
+    """
+    Scrie cookies.txt pe disk din env var YTDLP_COOKIES_B64 (base64).
+    Folosit de yt-dlp prin optiunea 'cookiefile'.
+    """
+    b64 = os.environ.get("YTDLP_COOKIES_B64", "").strip()
+    path = os.environ.get("YTDLP_COOKIES", "/app/cookies.txt").strip()
+
+    if not b64:
+        print("[cookies] YTDLP_COOKIES_B64 not set; skipping")
+        return
+
+    try:
+        data = base64.b64decode(b64.encode("utf-8"))
+        # dacă path nu are folder (rare), nu încercăm să creăm
+        folder = os.path.dirname(path)
+        if folder:
+            os.makedirs(folder, exist_ok=True)
+
+        with open(path, "wb") as f:
+            f.write(data)
+
+        print(f"[cookies] written to {path} ({len(data)} bytes)")
+    except Exception as e:
+        print(f"[cookies] failed to write: {e}")
 
 def select_diverse_unique_top(candidates: list, k: int, hash_min_dist: int = 12, min_ts_gap: float = 0.0) -> list:
     """
@@ -455,6 +480,7 @@ def make_gif(video_path: str, center_ts: float, out_gif: str, fps: int, seconds:
 def extract(req: ExtractRequest, request: Request,  x_api_key: str | None = Header(default=None)):
     try:
         ensure_tools()
+        ensure_cookies_file()
         require_key(x_api_key)
         job_id = str(uuid.uuid4())
         os.makedirs(job_id, exist_ok=True)
