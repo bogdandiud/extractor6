@@ -83,15 +83,28 @@ def download_video(url: str, output_path: str):
             f.write(r.content)
         return
 
-    # YouTube / etc.
+    cookies_file = os.environ.get("YTDLP_COOKIES", "").strip()
+
     ydl_opts = {
         "outtmpl": output_path,
         "format": "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b",
         "quiet": False,
         "noplaylist": True,
+        "merge_output_format": "mp4",
+        "retries": 3,
+        "fragment_retries": 3,
+        "concurrent_fragment_downloads": 4,
     }
+
+    if cookies_file and os.path.exists(cookies_file):
+        ydl_opts["cookiefile"] = cookies_file
+        print(f"[yt] using cookies file: {cookies_file}")
+    else:
+        print("[yt] cookies file missing; continuing without cookies")
+
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
+
 
 def require_key(x_api_key: str | None):
     expected = os.environ.get("TAGGLE_API_KEY", "")
