@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+pydantic
+requests
+yt-dlp
+opencv-python-headless
+numpy
+scenedetect
