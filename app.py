@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Header
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -7,6 +7,7 @@ import yt_dlp
 
 import cv2
 import numpy as np
+import time
 
 app = FastAPI()
 
@@ -91,6 +92,12 @@ def download_video(url: str, output_path: str):
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
+
+def require_key(x_api_key: str | None):
+    expected = os.environ.get("TAGGLE_API_KEY", "")
+    # dacă nu ai setat cheia în Render, nu blochează (mod dev)
+    if expected and x_api_key != expected:
+        raise HTTPException(status_code=401, detail="Invalid API key")
 
 
 def parse_timecode(t: str) -> float:
@@ -445,10 +452,10 @@ def make_gif(video_path: str, center_ts: float, out_gif: str, fps: int, seconds:
 
 
 @app.post("/extract")
-def extract(req: ExtractRequest, request: Request):
+def extract(req: ExtractRequest, request: Request,  x_api_key: str | None = Header(default=None)):
     try:
         ensure_tools()
-
+        require_key(x_api_key)
         job_id = str(uuid.uuid4())
         os.makedirs(job_id, exist_ok=True)
         video_path = f"{job_id}/input.mp4"
