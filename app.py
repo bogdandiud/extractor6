@@ -8,6 +8,9 @@ import base64
 import cv2
 import numpy as np
 import time
+import json
+from typing import Optional
+from datetime import datetime
 
 app = FastAPI()
 
@@ -22,6 +25,14 @@ app.add_middleware(
 
 # Servește fișierele generate: /files/<job_id>/...
 app.mount("/files", StaticFiles(directory="."), name="files")
+
+# Global cookie status tracking
+COOKIE_STATUS = {
+    "loaded": False,
+    "path": None,
+    "last_check": None,
+    "error": None
+}
 
 
 class ExtractRequest(BaseModel):
@@ -41,6 +52,9 @@ class ExtractRequest(BaseModel):
     gif_fps: int = 15          # (compat Bubble) dar backend-ul îl forțează la 15
     gif_seconds: int = 10      # tu alegi, backend clamp 3..10
     gif_width: int = 480       # reduce dacă vrei fișiere mai mici
+    
+    # Optional: direct cookies from request (base64 encoded)
+    cookies_b64: Optional[str] = None
 
 
 def sh(cmd):
@@ -58,9 +72,42 @@ def health():
         "cwd": os.getcwd(),
         "ffmpeg": status(["ffmpeg", "-version"]),
         "ffprobe": status(["ffprobe", "-version"]),
-        "scenedetect": status(["scenedetect", "-h"]),  # la tine nu merge -version
+        "scenedetect": status(["scenedetect", "-h"]),
         "opencv": cv2.__version__,
+        "cookie_status": COOKIE_STATUS,
     }
+
+
+@app.get("/cookie-status")
+def cookie_status():
+    """Check if cookies are properly configured"""
+    ensure_cookies_file()
+    
+    cookies_path = os.environ.get("YTDLP_COOKIES", "/app/cookies.txt").strip()
+    cookies_exist = os.path.exists(cookies_path)
+    cookies_size = os.path.getsize(cookies_path) if cookies_exist else 0
+    
+    b64_env = os.environ.get("YTDLP_COOKIES_B64", "").strip()
+    b64_configured = len(b64_env) > 0
+    
+    return {
+        "cookies_configured": b64_configured,
+        "cookies_file_exists": cookies_exist,
+        "cookies_file_size": cookies_size,
+        "cookies_path": cookies_path,
+        "status": COOKIE_STATUS,
+        "recommendation": get_cookie_recommendation(b64_configured, cookies_exist, cookies_size)
+    }
+
+
+def get_cookie_recommendation(b64_configured: bool, file_exists: bool, file_size: int) -> str:
+    if not b64_configured:
+        return "YTDLP_COOKIES_B64 environment variable not set. YouTube downloads may fail. Please export cookies from your browser and set this variable."
+    if not file_exists:
+        return "Cookie file not found. Check YTDLP_COOKIES path."
+    if file_size < 100:
+        return "Cookie file seems too small. Cookies may be invalid or expired."
+    return "Cookies appear to be configured correctly."
 
 
 def ensure_tools():
@@ -74,36 +121,225 @@ def ensure_tools():
         raise RuntimeError(f"scenedetect nu este disponibil în PATH: {err}")
 
 
-def download_video(url: str, output_path: str):
-    # direct mp4
-    if url.lower().endswith(".mp4"):
-        r = requests.get(url, timeout=180)
-        r.raise_for_status()
-        with open(output_path, "wb") as f:
-            f.write(r.content)
-        return
+def ensure_cookies_file(request_cookies_b64: Optional[str] = None):
+    """
+    Scrie cookies.txt pe disk din:
+    1. Request body (cookies_b64 parameter) - highest priority
+    2. Environment variable YTDLP_COOKIES_B64
+    
+    Returns the path to cookies file or None if no cookies available.
+    """
+    global COOKIE_STATUS
+    
+    path = os.environ.get("YTDLP_COOKIES", "/app/cookies.txt").strip()
+    
+    # Priority 1: Cookies from request
+    if request_cookies_b64 and request_cookies_b64.strip():
+        try:
+            data = base64.b64decode(request_cookies_b64.strip().encode("utf-8"))
+            folder = os.path.dirname(path)
+            if folder:
+                os.makedirs(folder, exist_ok=True)
+            
+            with open(path, "wb") as f:
+                f.write(data)
+            
+            COOKIE_STATUS = {
+                "loaded": True,
+                "path": path,
+                "last_check": datetime.now().isoformat(),
+                "error": None,
+                "source": "request"
+            }
+            print(f"[cookies] written from request to {path} ({len(data)} bytes)")
+            return path
+        except Exception as e:
+            print(f"[cookies] failed to write from request: {e}")
+    
+    # Priority 2: Environment variable
+    b64 = os.environ.get("YTDLP_COOKIES_B64", "").strip()
+    
+    if not b64:
+        COOKIE_STATUS = {
+            "loaded": False,
+            "path": None,
+            "last_check": datetime.now().isoformat(),
+            "error": "YTDLP_COOKIES_B64 not set",
+            "source": None
+        }
+        print("[cookies] YTDLP_COOKIES_B64 not set; YouTube downloads may fail")
+        return None
 
-    cookies_file = os.environ.get("YTDLP_COOKIES", "").strip()
+    try:
+        data = base64.b64decode(b64.encode("utf-8"))
+        folder = os.path.dirname(path)
+        if folder:
+            os.makedirs(folder, exist_ok=True)
 
-    ydl_opts = {
-        "outtmpl": output_path,
-        "format": "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b",
-        "quiet": False,
-        "noplaylist": True,
-        "merge_output_format": "mp4",
-        "retries": 3,
-        "fragment_retries": 3,
-        "concurrent_fragment_downloads": 4,
-    }
+        with open(path, "wb") as f:
+            f.write(data)
 
-    if cookies_file and os.path.exists(cookies_file):
-        ydl_opts["cookiefile"] = cookies_file
-        print(f"[yt] using cookies file: {cookies_file}")
+        COOKIE_STATUS = {
+            "loaded": True,
+            "path": path,
+            "last_check": datetime.now().isoformat(),
+            "error": None,
+            "source": "environment"
+        }
+        print(f"[cookies] written from env to {path} ({len(data)} bytes)")
+        return path
+    except Exception as e:
+        COOKIE_STATUS = {
+            "loaded": False,
+            "path": None,
+            "last_check": datetime.now().isoformat(),
+            "error": str(e),
+            "source": "environment"
+        }
+        print(f"[cookies] failed to write: {e}")
+        return None
+
+
+def is_youtube_url(url: str) -> bool:
+    """Check if URL is a YouTube URL"""
+    youtube_patterns = [
+        "youtube.com",
+        "youtu.be",
+        "youtube-nocookie.com",
+        "googlevideo.com"
+    ]
+    url_lower = url.lower()
+    return any(pattern in url_lower for pattern in youtube_patterns)
+
+
+def is_direct_video_url(url: str) -> bool:
+    """Check if URL is a direct video file"""
+    video_extensions = [".mp4", ".webm", ".mkv", ".avi", ".mov", ".m4v"]
+    url_lower = url.lower().split("?")[0]  # Remove query params
+    return any(url_lower.endswith(ext) for ext in video_extensions)
+
+
+def download_video(url: str, output_path: str, cookies_path: Optional[str] = None):
+    """
+    Download video with improved error handling and multiple fallback strategies.
+    """
+    errors_collected = []
+    
+    # Strategy 1: Direct download for direct video URLs
+    if is_direct_video_url(url):
+        try:
+            print(f"[download] Attempting direct download for: {url[:80]}...")
+            r = requests.get(url, timeout=180, stream=True)
+            r.raise_for_status()
+            with open(output_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                print(f"[download] Direct download successful")
+                return
+        except Exception as e:
+            errors_collected.append(f"Direct download failed: {str(e)}")
+            print(f"[download] Direct download failed: {e}")
+    
+    # Strategy 2: yt-dlp with cookies (if available)
+    if cookies_path and os.path.exists(cookies_path):
+        try:
+            print(f"[download] Attempting yt-dlp with cookies...")
+            ydl_opts = {
+                "outtmpl": output_path,
+                "format": "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b",
+                "quiet": False,
+                "noplaylist": True,
+                "merge_output_format": "mp4",
+                "retries": 3,
+                "fragment_retries": 3,
+                "concurrent_fragment_downloads": 4,
+                "cookiefile": cookies_path,
+                "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
+            }
+            
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+            
+            if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                print(f"[download] yt-dlp with cookies successful")
+                return
+        except Exception as e:
+            error_msg = str(e)
+            errors_collected.append(f"yt-dlp with cookies failed: {error_msg}")
+            print(f"[download] yt-dlp with cookies failed: {e}")
+    
+    # Strategy 3: yt-dlp without cookies (for non-restricted videos)
+    if not is_youtube_url(url) or not cookies_path:
+        try:
+            print(f"[download] Attempting yt-dlp without cookies...")
+            ydl_opts = {
+                "outtmpl": output_path,
+                "format": "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b",
+                "quiet": False,
+                "noplaylist": True,
+                "merge_output_format": "mp4",
+                "retries": 3,
+                "fragment_retries": 3,
+            }
+            
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+            
+            if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                print(f"[download] yt-dlp without cookies successful")
+                return
+        except Exception as e:
+            errors_collected.append(f"yt-dlp without cookies failed: {str(e)}")
+            print(f"[download] yt-dlp without cookies failed: {e}")
+    
+    # Strategy 4: Alternative yt-dlp formats
+    try:
+        print(f"[download] Attempting yt-dlp with alternative format...")
+        ydl_opts = {
+            "outtmpl": output_path,
+            "format": "best[ext=mp4]/best",
+            "quiet": False,
+            "noplaylist": True,
+            "retries": 5,
+        }
+        if cookies_path and os.path.exists(cookies_path):
+            ydl_opts["cookiefile"] = cookies_path
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+        
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            print(f"[download] yt-dlp alternative format successful")
+            return
+    except Exception as e:
+        errors_collected.append(f"yt-dlp alternative format failed: {str(e)}")
+        print(f"[download] yt-dlp alternative format failed: {e}")
+    
+    # All strategies failed
+    error_summary = "\n".join(errors_collected)
+    
+    # Provide helpful error message
+    if is_youtube_url(url):
+        if not cookies_path or not os.path.exists(cookies_path):
+            raise RuntimeError(
+                f"YouTube download failed - COOKIES NOT CONFIGURED!\n\n"
+                f"To fix this:\n"
+                f"1. Export cookies from your browser while logged into YouTube\n"
+                f"2. Convert to base64 and set YTDLP_COOKIES_B64 environment variable\n"
+                f"3. Or pass cookies_b64 in the request body\n\n"
+                f"See: https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp\n\n"
+                f"Errors: {error_summary}"
+            )
+        else:
+            raise RuntimeError(
+                f"YouTube download failed - COOKIES MAY BE EXPIRED!\n\n"
+                f"Your cookies file exists but download still failed.\n"
+                f"Please export fresh cookies from your browser.\n\n"
+                f"Errors: {error_summary}"
+            )
     else:
-        print("[yt] cookies file missing; continuing without cookies")
-
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([url])
+        raise RuntimeError(f"Video download failed after all attempts.\n\nErrors: {error_summary}")
 
 
 def require_key(x_api_key: str | None):
@@ -137,7 +373,7 @@ def find_scenes_csv(folder: str) -> str:
 
 def read_timecode_list_csv(csv_path: str):
     """
-    Uneori scenedetect exportă un CSV de tip “Timecode List”.
+    Uneori scenedetect exportă un CSV de tip "Timecode List".
     Extragem orice celulă care pare timecode.
     """
     with open(csv_path, newline="", encoding="utf-8") as f:
@@ -268,7 +504,7 @@ def _motion_score(img_a: np.ndarray, img_b: np.ndarray) -> float:
 
 def score_frame(img_bgr: np.ndarray) -> dict:
     """
-    Scor “director-friendly”:
+    Scor "director-friendly":
     - fețe / mimică (mai multă greutate + close-up)
     - sharpness (overall + în zona feței)
     - contrast / lumină (și penalizare clip highlights/shadows)
@@ -373,31 +609,6 @@ def is_unique_hash(new_hash: int, used_hashes: list, min_dist: int) -> bool:
             return False
     return True
 
-def ensure_cookies_file():
-    """
-    Scrie cookies.txt pe disk din env var YTDLP_COOKIES_B64 (base64).
-    Folosit de yt-dlp prin optiunea 'cookiefile'.
-    """
-    b64 = os.environ.get("YTDLP_COOKIES_B64", "").strip()
-    path = os.environ.get("YTDLP_COOKIES", "/app/cookies.txt").strip()
-
-    if not b64:
-        print("[cookies] YTDLP_COOKIES_B64 not set; skipping")
-        return
-
-    try:
-        data = base64.b64decode(b64.encode("utf-8"))
-        # dacă path nu are folder (rare), nu încercăm să creăm
-        folder = os.path.dirname(path)
-        if folder:
-            os.makedirs(folder, exist_ok=True)
-
-        with open(path, "wb") as f:
-            f.write(data)
-
-        print(f"[cookies] written to {path} ({len(data)} bytes)")
-    except Exception as e:
-        print(f"[cookies] failed to write: {e}")
 
 def select_diverse_unique_top(candidates: list, k: int, hash_min_dist: int = 12, min_ts_gap: float = 0.0) -> list:
     """
@@ -490,17 +701,23 @@ def make_gif(video_path: str, center_ts: float, out_gif: str, fps: int, seconds:
 
 
 @app.post("/extract")
-def extract(req: ExtractRequest, request: Request,  x_api_key: str | None = Header(default=None)):
+def extract(req: ExtractRequest, request: Request, x_api_key: str | None = Header(default=None)):
     try:
         ensure_tools()
-        ensure_cookies_file()
         require_key(x_api_key)
+        
+        # Handle cookies - check request body first, then env var
+        cookies_path = ensure_cookies_file(req.cookies_b64)
+        
         job_id = str(uuid.uuid4())
         os.makedirs(job_id, exist_ok=True)
         video_path = f"{job_id}/input.mp4"
 
         print(f"\n[Job {job_id}] DOWNLOAD...")
-        download_video(req.video_url, video_path)
+        print(f"[Job {job_id}] URL: {req.video_url[:80]}...")
+        print(f"[Job {job_id}] Cookies available: {cookies_path is not None}")
+        
+        download_video(req.video_url, video_path, cookies_path)
 
         dur = video_duration_seconds(video_path)
         print(f"[Job {job_id}] duration={dur:.2f}s")
@@ -686,7 +903,67 @@ def extract(req: ExtractRequest, request: Request,  x_api_key: str | None = Head
                 "max_gifs": int(req.max_gifs),
             },
             "gif_errors_preview": gif_errors[:2],
+            "cookie_status": COOKIE_STATUS,
         }
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        error_msg = str(e)
+        
+        # Provide more helpful error for YouTube auth issues
+        if "Sign in to confirm" in error_msg or "bot" in error_msg.lower():
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "error": "YouTube Authentication Required",
+                    "message": "YouTube is blocking this request. You need to configure cookies.",
+                    "solution": [
+                        "1. Export cookies from your browser while logged into YouTube",
+                        "2. Convert cookies.txt to base64",
+                        "3. Set YTDLP_COOKIES_B64 environment variable in Render",
+                        "4. Or pass cookies_b64 in the request body"
+                    ],
+                    "docs": "https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp",
+                    "original_error": error_msg[:500]
+                }
+            )
+        
+        raise HTTPException(status_code=500, detail=error_msg)
+
+
+@app.post("/test-youtube")
+def test_youtube(url: str = "https://www.youtube.com/watch?v=dQw4w9WgXcQ", 
+                 cookies_b64: Optional[str] = None,
+                 x_api_key: str | None = Header(default=None)):
+    """
+    Test endpoint to verify YouTube download capability without full processing.
+    """
+    require_key(x_api_key)
+    cookies_path = ensure_cookies_file(cookies_b64)
+    
+    try:
+        ydl_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "extract_flat": True,
+        }
+        if cookies_path and os.path.exists(cookies_path):
+            ydl_opts["cookiefile"] = cookies_path
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            
+        return {
+            "success": True,
+            "title": info.get("title", "Unknown"),
+            "duration": info.get("duration", 0),
+            "cookies_used": cookies_path is not None,
+            "cookie_status": COOKIE_STATUS
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "cookies_used": cookies_path is not None,
+            "cookie_status": COOKIE_STATUS,
+            "recommendation": "If you see 'Sign in to confirm', you need to configure YouTube cookies."
+        }
